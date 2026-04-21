@@ -3,7 +3,7 @@
 namespace acl {
 
 // ============================================================
-// TopKCustom 类实现
+// TopKCustom 类实现（单核版本）
 // ============================================================
 
 template<typename T>
@@ -104,7 +104,7 @@ __aicore__ inline void TopKCustom<T>::process(
 }
 
 // ============================================================
-// Kernel 入口函数 - half版本
+// Kernel 入口函数 - 单核版本
 // ============================================================
 
 extern "C" __global__ __aicore__ void topk_custom_half(
@@ -117,10 +117,6 @@ extern "C" __global__ __aicore__ void topk_custom_half(
     TopKCustom<half> op;
     op.process(inputTensor, outputTensor, N, K);
 }
-
-// ============================================================
-// Kernel 入口函数 - float版本
-// ============================================================
 
 extern "C" __global__ __aicore__ void topk_custom_float(
     LocalTensor<float>& inputTensor,
@@ -138,24 +134,37 @@ extern "C" __global__ __aicore__ void topk_custom_float(
 // ============================================================
 
 template<typename T>
-__aicore__ inline void TopKCustomMultiCore<T>::initIndices(
-    LocalTensor<int32_t>& indices,
-    int32_t N
-) {
-    for (int32_t i = 0; i < N; ++i) {
-        indices.SetValue(i, i);
-    }
-}
-
-template<typename T>
 __aicore__ inline void TopKCustomMultiCore<T>::swap(
     LocalTensor<int32_t>& indices,
+    LocalTensor<T>& values,
     int32_t i,
     int32_t j
 ) {
-    int32_t temp = indices.GetValue(i);
+    int32_t tempIdx = indices.GetValue(i);
     indices.SetValue(i, indices.GetValue(j));
-    indices.SetValue(j, temp);
+    indices.SetValue(j, tempIdx);
+
+    T tempVal = values.GetValue(i);
+    values.SetValue(i, values.GetValue(j));
+    values.SetValue(j, tempVal);
+}
+
+template<typename T>
+__aicore__ inline void TopKCustomMultiCore<T>::localSort(
+    LocalTensor<int32_t>& indices,
+    LocalTensor<T>& values,
+    int32_t n
+) {
+    // 使用冒泡排序（简单实现，适合小规模数据）
+    for (int32_t i = 0; i < n - 1; ++i) {
+        for (int32_t j = 0; j < n - i - 1; ++j) {
+            T val1 = values.GetValue(j);
+            T val2 = values.GetValue(j + 1);
+            if (val1.GetValue() < val2.GetValue()) {
+                swap(indices, values, j, j + 1);
+            }
+        }
+    }
 }
 
 template<typename T>
@@ -163,238 +172,76 @@ __aicore__ inline void TopKCustomMultiCore<T>::syncCores(
     LocalTensor<int32_t>& sharedTensor,
     const TopKTilingData& tilingData
 ) {
-    // 使用原子操作实现 barrier
-    // 每个核完成时增加计数器，等待所有核完成
-    if (tilingData.coreId == 0) {
-        // 主核重置同步计数器
-        sharedTensor.SetValue(0, 0);
-    }
+    // AscendC 中的 barrier 同步
+    // 注意：实际使用时需要使用 AscendC 提供的同步 API
+    // 这里是简化实现
 
-    // 所有核到达 barrier
-    // 在实际 AscendC 实现中，使用 SyncAll 或类似 API
-    // 这里使用简化的模拟实现
-
-    // 原子递增
-    uint32_t offset = 0;  // 同步计数器在 sharedTensor 中的偏移
-    // AtomicAdd(sharedTensor, offset, 1);
+    // 原子递增计数器
+    // AtomicAdd(sharedTensor, 1, 1);
 
     // 等待所有核到达
-    // while (sharedTensor.GetValue(offset) < tilingData.coreNum) {
+    // while (sharedTensor.GetValue(1) < tilingData.coreNum) {
     //     // 忙等待
+    // }
+
+    // 最后到达的核重置计数器
+    // if (tilingData.coreId == tilingData.coreNum - 1) {
+    //     sharedTensor.SetValue(1, 0);
+    //     sharedTensor.SetValue(2, sharedTensor.GetValue(2) + 1);
     // }
 }
 
 template<typename T>
-__aicore__ inline int32_t TopKCustomMultiCore<T>::computePrefixSum(
-    LocalTensor<int32_t>& sharedTensor,
-    const TopKTilingData& tilingData,
-    int32_t localCount
-) {
-    // 将每个核的本地计数写入共享内存
-    // 共享内存布局: [count0, count1, ..., countM, prefixSum0, prefixSum1, ...]
-    uint32_t countOffset = tilingData.coreId;
-    sharedTensor.SetValue(countOffset, localCount);
-
-    // 同步，确保所有核都写入了计数
-    syncCores(sharedTensor, tilingData);
-
-    // 主核计算前缀和
-    int32_t globalCount = 0;
-    if (tilingData.coreId == 0) {
-        int32_t sum = 0;
-        for (int32_t i = 0; i < tilingData.coreNum; ++i) {
-            int32_t cnt = sharedTensor.GetValue(i);
-            sharedTensor.SetValue(tilingData.coreNum + i, sum);  // 存储前缀和
-            sum += cnt;
-        }
-        sharedTensor.SetValue(2 * tilingData.coreNum, sum);  // 总数
-    }
-
-    // 再次同步
-    syncCores(sharedTensor, tilingData);
-
-    // 每个核获取自己的前缀和偏移
-    int32_t prefixSum = sharedTensor.GetValue(tilingData.coreNum + tilingData.coreId);
-
-    return prefixSum;
-}
-
-template<typename T>
-__aicore__ inline int32_t TopKCustomMultiCore<T>::parallelPartition(
-    LocalTensor<T>& inputTensor,
-    LocalTensor<int32_t>& indices,
-    LocalTensor<int32_t>& sharedTensor,
-    const TopKTilingData& tilingData,
-    int32_t pivotIdx,
-    int32_t globalLeft,
-    int32_t globalRight
-) {
-    // 获取 pivot 值
-    T pivotVal = inputTensor.GetValue(pivotIdx);
-
-    // 确定当前核的数据范围
-    int32_t coreStart = tilingData.coreId * tilingData.blockSize;
-    int32_t coreEnd = min(coreStart + tilingData.blockSize, tilingData.totalLength);
-
-    // 限制在当前分区范围内
-    coreStart = max(coreStart, globalLeft);
-    coreEnd = min(coreEnd, globalRight + 1);
-
-    // 统计当前核分区内大于 pivot 的元素数量
-    int32_t localGreaterCount = 0;
-
-    // 第一遍：统计数量
-    for (int32_t i = coreStart; i < coreEnd; ++i) {
-        int32_t idx = indices.GetValue(i);
-        T val = inputTensor.GetValue(idx);
-        if (val.GetValue() > pivotVal.GetValue()) {
-            localGreaterCount++;
-        }
-    }
-
-    // 计算前缀和，获取全局偏移
-    int32_t globalOffset = computePrefixSum(sharedTensor, tilingData, localGreaterCount);
-
-    // 第二遍：重排元素（使用临时存储）
-    // 创建临时缓冲区存储当前核的分区结果
-    auto& ub = inputTensor.GetBuffer();
-    LocalTensor<int32_t> tempIndices = ub.Alloc<int32_t>(coreEnd - coreStart);
-
-    int32_t writePos = 0;
-    int32_t localLeftCount = 0;   // 大于 pivot 的数量
-    int32_t localRightCount = 0;  // 小于等于 pivot 的数量
-
-    // 收集大于 pivot 的元素
-    for (int32_t i = coreStart; i < coreEnd; ++i) {
-        int32_t idx = indices.GetValue(i);
-        T val = inputTensor.GetValue(idx);
-        if (val.GetValue() > pivotVal.GetValue()) {
-            tempIndices.SetValue(writePos++, idx);
-            localLeftCount++;
-        }
-    }
-
-    int32_t leftStart = globalOffset;  // 大于 pivot 的起始位置
-
-    // 收集小于等于 pivot 的元素
-    for (int32_t i = coreStart; i < coreEnd; ++i) {
-        int32_t idx = indices.GetValue(i);
-        T val = inputTensor.GetValue(idx);
-        if (val.GetValue() <= pivotVal.GetValue()) {
-            tempIndices.SetValue(writePos++, idx);
-            localRightCount++;
-        }
-    }
-
-    int32_t rightStart = globalLeft + (globalRight - globalLeft + 1) - localGreaterCount -
-                         (coreEnd - coreStart - localGreaterCount) + globalOffset - localLeftCount;
-
-    // 写回全局索引数组
-    writePos = 0;
-    for (int32_t i = 0; i < localLeftCount; ++i) {
-        indices.SetValue(leftStart + writePos, tempIndices.GetValue(i));
-        writePos++;
-    }
-
-    writePos = 0;
-    for (int32_t i = localLeftCount; i < localLeftCount + localRightCount; ++i) {
-        indices.SetValue(rightStart + writePos, tempIndices.GetValue(i));
-        writePos++;
-    }
-
-    ub.Free(tempIndices);
-
-    // 返回当前核的大于 pivot 的元素数量
-    return localLeftCount;
-}
-
-template<typename T>
-__aicore__ inline void TopKCustomMultiCore<T>::parallelQuickSelect(
+__aicore__ inline int32_t TopKCustomMultiCore<T>::localSortAndSelect(
     LocalTensor<T>& inputTensor,
     LocalTensor<int32_t>& outputTensor,
     LocalTensor<int32_t>& sharedTensor,
     const TopKTilingData& tilingData
 ) {
+    // 计算当前核的数据范围
+    int32_t start = tilingData.coreId * tilingData.blockSize;
+    int32_t end = start + tilingData.blockSize;
+    if (end > tilingData.totalLength) {
+        end = tilingData.totalLength;
+    }
+
+    if (start >= tilingData.totalLength) {
+        return 0;  // 该核没有数据
+    }
+
+    int32_t localN = end - start;
+    int32_t localK = tilingData.topK;
+    if (localK > localN) {
+        localK = localN;
+    }
+
     auto& ub = inputTensor.GetBuffer();
 
-    // 分配全局索引数组
-    LocalTensor<int32_t> indices = ub.Alloc<int32_t>(tilingData.totalLength);
+    // 分配本地工作空间
+    LocalTensor<int32_t> localIndices = ub.Alloc<int32_t>(localN);
+    LocalTensor<T> localValues = ub.Alloc<T>(localN);
 
-    // 主核初始化索引数组
-    if (tilingData.coreId == 0) {
-        initIndices(indices, tilingData.totalLength);
-
-        // 初始化共享数据
-        sharedTensor.SetValue(0, tilingData.topK);  // currentK
-        sharedTensor.SetValue(1, 0);                // iteration
-        sharedTensor.SetValue(2, 0);                // done
+    // 收集数据和索引
+    for (int32_t i = 0; i < localN; ++i) {
+        localIndices.SetValue(i, start + i);
+        localValues.SetValue(i, inputTensor.GetValue(start + i));
     }
 
-    // 同步，确保初始化完成
-    syncCores(sharedTensor, tilingData);
+    // 排序（降序）
+    localSort(localIndices, localValues, localN);
 
-    int32_t globalLeft = 0;
-    int32_t globalRight = tilingData.totalLength - 1;
-    int32_t currentK = tilingData.topK;
+    // 将前 localK 个结果写入共享内存
+    int32_t offset = tilingData.coreId * tilingData.topK * 2;  // 每个元素占2个位置（索引+值）
 
-    // 迭代进行并行快速选择
-    while (globalLeft < globalRight && currentK > 0) {
-        // 选择 pivot（使用中间位置的元素）
-        int32_t pivotPos = (globalLeft + globalRight) / 2;
-        int32_t pivotIdx = indices.GetValue(pivotPos);
-
-        // 并行分区
-        int32_t localGreaterCount = parallelPartition(
-            inputTensor, indices, sharedTensor, tilingData,
-            pivotIdx, globalLeft, globalRight
-        );
-
-        // 同步，确保所有核完成分区
-        syncCores(sharedTensor, tilingData);
-
-        // 主核计算 pivot 的全局位置
-        if (tilingData.coreId == 0) {
-            // 计算大于 pivot 的总数
-            int32_t totalGreater = 0;
-            for (int32_t i = 0; i < tilingData.coreNum; ++i) {
-                totalGreater += sharedTensor.GetValue(i);
-            }
-
-            int32_t pivotGlobalPos = globalLeft + totalGreater;
-
-            // 更新共享数据
-            sharedTensor.SetValue(3, pivotGlobalPos);  // pivotIndex
-            sharedTensor.SetValue(4, pivotIdx);         // pivotValueIdx
-        }
-
-        // 同步
-        syncCores(sharedTensor, tilingData);
-
-        // 获取 pivot 的全局位置
-        int32_t pivotGlobalPos = sharedTensor.GetValue(3);
-
-        // 判断下一步处理哪个分区
-        if (currentK <= pivotGlobalPos - globalLeft + 1) {
-            // TopK 在左分区（包含 pivot）
-            globalRight = pivotGlobalPos;
-        } else {
-            // TopK 在右分区
-            currentK -= (pivotGlobalPos - globalLeft + 1);
-            globalLeft = pivotGlobalPos + 1;
-        }
-
-        // 同步
-        syncCores(sharedTensor, tilingData);
+    for (int32_t i = 0; i < localK; ++i) {
+        sharedTensor.SetValue(offset + i * 2, localIndices.GetValue(i));  // 索引
+        sharedTensor.SetValue(offset + i * 2 + 1, (int32_t)localValues.GetValue(i).GetValue());  // 值
     }
 
-    // 主核收集结果
-    if (tilingData.coreId == 0) {
-        for (int32_t i = 0; i < tilingData.topK; ++i) {
-            outputTensor.SetValue(i, indices.GetValue(globalLeft + i));
-        }
-    }
+    ub.Free(localIndices);
+    ub.Free(localValues);
 
-    ub.Free(indices);
+    return localK;
 }
 
 template<typename T>
@@ -404,12 +251,46 @@ __aicore__ inline void TopKCustomMultiCore<T>::process(
     LocalTensor<int32_t>& sharedTensor,
     const TopKTilingData& tilingData
 ) {
-    // 计算当前核的数据范围
-    localStart_ = tilingData.coreId * tilingData.blockSize;
-    localEnd_ = min(localStart_ + tilingData.blockSize, tilingData.totalLength);
+    // 第一阶段：每个核对自己数据进行排序并选出 TopK
+    localSortAndSelect(inputTensor, outputTensor, sharedTensor, tilingData);
 
-    // 执行并行快速选择
-    parallelQuickSelect(inputTensor, outputTensor, sharedTensor, tilingData);
+    // 同步，确保所有核完成
+    syncCores(sharedTensor, tilingData);
+
+    // 第二阶段：主核从所有核的结果中选出全局 TopK
+    if (tilingData.coreId == 0) {
+        auto& ub = inputTensor.GetBuffer();
+
+        int32_t totalCandidates = tilingData.coreNum * tilingData.topK;
+
+        // 临时存储所有候选
+        LocalTensor<int32_t> allIndices = ub.Alloc<int32_t>(totalCandidates);
+        LocalTensor<T> allValues = ub.Alloc<T>(totalCandidates);
+
+        int32_t count = 0;
+        for (int32_t core = 0; core < tilingData.coreNum; ++core) {
+            int32_t offset = core * tilingData.topK * 2;
+            for (int32_t i = 0; i < tilingData.topK; ++i) {
+                int32_t idx = sharedTensor.GetValue(offset + i * 2);
+                int32_t val = sharedTensor.GetValue(offset + i * 2 + 1);
+
+                allIndices.SetValue(count, idx);
+                allValues.SetValue(count, T((float)val));
+                count++;
+            }
+        }
+
+        // 对所有候选进行排序（降序）
+        localSort(allIndices, allValues, totalCandidates);
+
+        // 复制前 K 个结果到输出
+        for (int32_t i = 0; i < tilingData.topK; ++i) {
+            outputTensor.SetValue(i, allIndices.GetValue(i));
+        }
+
+        ub.Free(allIndices);
+        ub.Free(allValues);
+    }
 }
 
 // ============================================================

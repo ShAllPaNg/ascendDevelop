@@ -25,20 +25,16 @@ struct TopKTilingData {
 // ============================================================
 
 struct TopKSharedData {
-    int32_t pivotIndex;     // pivot 的全局位置
-    int32_t pivotValueIdx;  // pivot 对应的索引值
-    int32_t leftCount;      // 左侧（大于pivot）的元素总数
-    int32_t rightCount;     // 右侧（小于等于pivot）的元素总数
-    int32_t currentK;       // 当前需要找的第 K 大
-    int32_t iteration;      // 迭代次数（用于同步）
-    int32_t done;           // 完成标志
+    int32_t coreResultsOffset;  // 每个核结果的起始偏移
+    int32_t barrierCounter;     // barrier 同步计数器
+    int32_t phase;              // barrier 阶段
 };
 
 /**
  * @brief TopK Custom算子实现（多核并行版本）
  *
  * 从输入数据中找出最大的K个元素对应的索引
- * 使用并行快速选择(Parallel QuickSelect)算法
+ * 策略：每个核对自己的数据排序选出TopK，主核合并结果
  *
  * @tparam T 数据类型 (half 或 float)
  */
@@ -65,9 +61,10 @@ public:
 
 private:
     /**
-     * @brief 并行快速选择算法主函数
+     * @brief 本地排序并选出TopK
+     * @return 返回选出的元素数量
      */
-    __aicore__ inline void parallelQuickSelect(
+    __aicore__ inline int32_t localSortAndSelect(
         LocalTensor<T>& inputTensor,
         LocalTensor<int32_t>& outputTensor,
         LocalTensor<int32_t>& sharedTensor,
@@ -75,43 +72,22 @@ private:
     );
 
     /**
-     * @brief 并行分区函数（多核协作）
-     * @return 当前核的分区内，大于 pivot 的元素数量
-     */
-    __aicore__ inline int32_t parallelPartition(
-        LocalTensor<T>& inputTensor,
-        LocalTensor<int32_t>& indices,
-        LocalTensor<int32_t>& sharedTensor,
-        const TopKTilingData& tilingData,
-        int32_t pivotIdx,
-        int32_t globalLeft,
-        int32_t globalRight
-    );
-
-    /**
-     * @brief 前缀和计算（计算全局 pivot 位置）
-     */
-    __aicore__ inline int32_t computePrefixSum(
-        LocalTensor<int32_t>& sharedTensor,
-        const TopKTilingData& tilingData,
-        int32_t localCount
-    );
-
-    /**
-     * @brief 交换索引数组中的两个元素
+     * @brief 交换两个元素
      */
     __aicore__ inline void swap(
         LocalTensor<int32_t>& indices,
+        LocalTensor<T>& values,
         int32_t i,
         int32_t j
     );
 
     /**
-     * @brief 初始化索引数组为 [0, 1, 2, ..., N-1]
+     * @brief 本地排序（降序）
      */
-    __aicore__ inline void initIndices(
+    __aicore__ inline void localSort(
         LocalTensor<int32_t>& indices,
-        int32_t N
+        LocalTensor<T>& values,
+        int32_t n
     );
 
     /**
